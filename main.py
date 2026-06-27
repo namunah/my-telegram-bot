@@ -4,6 +4,7 @@ from threading import Thread
 from flask import Flask
 import telebot
 from google import genai
+from google.genai.errors import APIError
 
 # =======================================================
 # ⚙️ CREDENTIAL MAPPING
@@ -23,39 +24,51 @@ def home():
     return "🤖 Bot status: Operational & Connected to Gemini Cloud Engine."
 
 def run_web_server():
-    # Render automatically provides a 'PORT' environment variable
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# 3. Core Message Processing Pipeline
+# 3. Core Message Processing Pipeline with Traffic Fallbacks
 @bot.message_handler(func=lambda message: True)
 def process_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash-lite',
-            contents=message.text.strip()
-        )
-        if response.text:
-            bot.reply_to(message, response.text)
-        else:
-            bot.reply_to(message, "🤖 Handled query, but no text was returned.")
-    except Exception as e:
-        print(f"⚠️ API Error: {str(e)}")
-        bot.reply_to(message, "⚠️ System encountered an issue processing that query.")
+    user_prompt = message.text.strip()
+    
+    # List of models to try in sequence if one hits a 503 error
+    fallback_models = ['gemini-2.5-flash', 'gemini-1.5-flash']
+    response_text = None
+
+    for model_name in fallback_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt
+            )
+            if response.text:
+                response_text = response.text
+                break  # Successfully got an answer, break out of loop
+        except APIError as api_err:
+            print(f"🔄 Model {model_name} busy or unavailable. Error: {api_err}")
+            time.sleep(1)  # Brief pause before fallback attempt
+            continue
+        except Exception as e:
+            print(f"⚠️ Unexpected error on {model_name}: {e}")
+            continue
+
+    # Dispatch final response back to Telegram
+    if response_text:
+        bot.reply_to(message, response_text)
+    else:
+        bot.reply_to(message, "⚠️ All Gemini cloud engines are currently facing extreme traffic spikes. Please wait a minute and try again.")
 
 # 4. Main Operational Launcher
 if __name__ == "__main__":
-    # Clean up old webhooks
     bot.delete_webhook(drop_pending_updates=True)
     time.sleep(1)
     
-    # Start the web server thread so Render stays happy
     print("🌐 Starting background web layout...")
     server_thread = Thread(target=run_web_server)
     server_thread.daemon = True
     server_thread.start()
     
-    # Start listening to Telegram
-    print("⚡ Bot pipeline is actively running...")
+    print("⚡ Bot pipeline is actively running with fallback engines...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
